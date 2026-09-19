@@ -1,0 +1,24 @@
+schema_version = "1.0.0"
+
+id = "freepicker"
+version = "4.0.0"
+name = "FreePicker"
+tagline = "Floating, drag-and-resize bone/object picker panel"
+maintainer = "Your Name <you@example.com>"
+type = "add-on"
+
+# Change this to match how you actually plan to distribute the addon.
+# GPL-3.0-or-later is required if you ever submit to extensions.blender.org.
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+tags = [
+    "Rigging",
+    "Animation",
+]
+
+blender_version_min = "5.0.0"
+
+[permissions]
+files = "Export/import picker layouts as a JSON file"

@@ -1,10 +1,10 @@
 schema_version = "1.0.0"
 
 id = "freepicker"
-version = "4.0.0"
+version = "4.1.0"
 name = "FreePicker"
 tagline = "Floating, drag-and-resize bone/object picker panel"
-maintainer = "Your Name <you@example.com>"
+maintainer = "dirun <kodirunart@gmail.com>"
 type = "add-on"
 
 # Change this to match how you actually plan to distribute the addon.

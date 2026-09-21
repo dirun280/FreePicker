@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FreePicker",
-    "author": "Custom Addon",
-    "version": (4, 0, 0),
+    "author": "dirun",
+    "version": (4, 1, 0),
     "blender": (5, 0, 0),
     "location": "View3D header (Object/Pose Mode) > FreePicker button",
     "description": "A fully self-contained picker: its own Pose-mode bone sets "
@@ -194,6 +194,63 @@ def clip_text(text, size, max_width):
 
 
 # ---------------------------------------------------------------------------
+# Multi-select color sync -- when several buttons are selected together in
+# Edit Mode (box-select), changing one's color via the right-click menu
+# broadcasts that color to the rest of the selection too. This has to sit
+# above the data classes below since it's wired in as a property update
+# callback at class-definition time.
+# ---------------------------------------------------------------------------
+
+_active_panel = {"instance": None}
+_color_sync_guard = {"active": False}
+
+
+def _sync_color_to_selection(entry, context):
+    if _color_sync_guard["active"]:
+        return
+    panel = _active_panel["instance"]
+    if panel is None or not getattr(panel, "edit_mode", False):
+        return
+    selected = getattr(panel, "edit_selected", None)
+    if not selected or len(selected) <= 1:
+        return
+
+    mode = context.mode
+    idx = None
+    if mode == 'POSE':
+        arm = context.object
+        if arm and arm.type == 'ARMATURE':
+            for i, item in enumerate(arm.freepicker_bone_sets):
+                if item.as_pointer() == entry.as_pointer():
+                    idx = i
+                    break
+    elif mode == 'OBJECT':
+        scene = context.scene
+        for i, item in enumerate(scene.freepicker_sets):
+            if item.as_pointer() == entry.as_pointer():
+                idx = i
+                break
+
+    if idx is None or idx not in selected:
+        return
+
+    _color_sync_guard["active"] = True
+    try:
+        color = entry.color[:]
+        for other_idx in selected:
+            if other_idx == idx:
+                continue
+            other = get_layout_entry(context, other_idx)
+            if other is not None:
+                other.color = color
+    finally:
+        _color_sync_guard["active"] = False
+
+    if context.area:
+        context.area.tag_redraw()
+
+
+# ---------------------------------------------------------------------------
 # Data  (unchanged from the original addon)
 # ---------------------------------------------------------------------------
 
@@ -219,6 +276,7 @@ class FREEPICKER_set(bpy.types.PropertyGroup):
     color: bpy.props.FloatVectorProperty(
         name="Tag Color", subtype='COLOR', size=4,
         default=(0.5, 0.5, 0.5, 1.0), min=0.0, max=1.0,
+        update=_sync_color_to_selection,
     )
     highlighted: bpy.props.BoolProperty(default=False)
     members: bpy.props.CollectionProperty(type=FREEPICKER_member)
@@ -241,6 +299,7 @@ class FREEPICKER_pose_set(bpy.types.PropertyGroup):
     color: bpy.props.FloatVectorProperty(
         name="Tag Color", subtype='COLOR', size=4,
         default=(0.5, 0.5, 0.5, 1.0), min=0.0, max=1.0,
+        update=_sync_color_to_selection,
     )
     highlighted: bpy.props.BoolProperty(default=False)
     members: bpy.props.CollectionProperty(type=FREEPICKER_bone_member)
@@ -789,10 +848,8 @@ class FREEPICKER_OT_import(bpy.types.Operator, ImportHelper):
 # invoked, since bpy.types.Menu can't take custom call-time arguments.
 _context_menu_index = {"value": -1}
 
-# Reference to the currently-running floating panel instance, so operators
-# triggered from the right-click menu (which is a separate popup/operator)
-# can hand control back to it -- e.g. to start the in-place rename editor.
-_active_panel = {"instance": None}
+# (_active_panel is declared earlier, above the data classes, since the
+# color-sync update callback needs it before those classes are defined.)
 
 
 class FREEPICKER_OT_start_rename(bpy.types.Operator):
@@ -866,6 +923,11 @@ class FREEPICKER_MT_row_menu(bpy.types.Menu):
             color_row = layout.row(align=True)
             color_row.label(text="", icon='COLOR')
             color_row.prop(entry, "color", text="")
+            panel = _active_panel["instance"]
+            if panel is not None and panel.edit_mode and idx in panel.edit_selected \
+                    and len(panel.edit_selected) > 1:
+                layout.label(text=f"Applies to {len(panel.edit_selected)} selected buttons",
+                             icon='INFO')
 
         layout.separator()
         dop = layout.operator("freepicker.remove_set", text="Delete Button", icon='X')

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FreePicker",
     "author": "dirun",
-    "version": (4, 1, 0),
+    "version": (4, 0, 2),
     "blender": (5, 0, 0),
     "location": "View3D header (Object/Pose Mode) > FreePicker button",
     "description": "A fully self-contained picker: its own Pose-mode bone sets "
@@ -1040,7 +1040,15 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
     # -- geometry / state -----------------------------------------------
 
     def local_mouse(self, context, event):
-        return event.mouse_x - context.region.x, event.mouse_y - context.region.y
+        region = context.region
+        if region is None:
+            # mouse is over an area/region that isn't a normal 3D Viewport
+            # window (e.g. the user switched that editor to something else,
+            # or is hovering a different area entirely) -- there's nothing
+            # sensible to compute here, so just report an out-of-bounds
+            # position instead of crashing.
+            return -100000.0, -100000.0
+        return event.mouse_x - region.x, event.mouse_y - region.y
 
     def rebuild_rows(self, context):
         mode = context.mode
@@ -1154,11 +1162,8 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         add_rect = (x + pad, top - pad - btn - dpi(8, context) - add_h, w - 2 * pad, add_h)
 
         toggle_h = dpi(24, context)
-        toggle_gap = dpi(6, context)
-        reset_w = dpi(30, context)
         toggle_y = add_rect[1] - dpi(6, context) - toggle_h
-        toggle_rect = (x + pad, toggle_y, w - 2 * pad - reset_w - toggle_gap, toggle_h)
-        reset_rect = (toggle_rect[0] + toggle_rect[2] + toggle_gap, toggle_y, reset_w, toggle_h)
+        toggle_rect = (x + pad, toggle_y, w - 2 * pad, toggle_h)
 
         small_h = dpi(22, context)
         small_y = toggle_rect[1] - dpi(6, context) - small_h
@@ -1169,7 +1174,7 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
 
         return {
             "close": close_rect, "title": title_rect, "add": add_rect,
-            "layout_toggle": toggle_rect, "layout_reset": reset_rect,
+            "layout_toggle": toggle_rect,
             "export": exp_rect, "import": imp_rect,
         }
 
@@ -1211,11 +1216,6 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         draw_rounded_rect(tx, ty, tw, th, dpi(6, context), toggle_color)
         draw_text(tx, ty + th * 0.22, toggle_label, max(8, dpi(10, context)),
                   toggle_text_color, align_center_width=tw)
-
-        rx0, ry0, rw0, rh0 = r["layout_reset"]
-        draw_rounded_rect(rx0, ry0, rw0, rh0, dpi(6, context), rgb01((70, 70, 72), 0.9))
-        draw_text(rx0, ry0 + rh0 * 0.12, "\u21bb", max(11, dpi(15, context)), (0.9, 0.9, 0.9, 1.0),
-                  align_center_width=rw0)
 
         for key, label in (("export", "Export"), ("import", "Import")):
             bx, by, bw, bh = r[key]
@@ -1479,10 +1479,48 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
     # -- modal -------------------------------------------------------------
 
     def modal(self, context, event):
+        # Safety net: this operator draws its own GPU overlay and reads
+        # context.region/area directly in a lot of places. If the user
+        # switches the 3D Viewport to a different editor (or the mouse ends
+        # up over an area/region this panel doesn't expect), an unhandled
+        # exception here would normally make Blender silently kill the
+        # modal operator WITHOUT running our cleanup -- leaving the draw
+        # handler and timer registered forever (a non-interactive "ghost"
+        # panel that still renders but never responds again). Catching
+        # everything here and finishing cleanly avoids that.
+        try:
+            return self._modal_impl(context, event)
+        except Exception as exc:
+            print("FreePicker: modal error, closing panel cleanly:", exc)
+            try:
+                return self.finish(context)
+            except Exception:
+                FREEPICKER_OT_floating_panel._is_open = False
+                if _active_panel["instance"] is self:
+                    _active_panel["instance"] = None
+                return {'CANCELLED'}
+
+    def _modal_impl(self, context, event):
         if self.closed:
             return self.finish(context)
-        if context.area is not None:
-            context.area.tag_redraw()
+
+        area = context.area
+        region = context.region
+        in_view3d = (area is not None and area.type == 'VIEW_3D'
+                     and region is not None and region.type == 'WINDOW')
+
+        if area is not None:
+            area.tag_redraw()
+
+        if not in_view3d:
+            # The mouse has moved outside the 3D Viewport (or this area was
+            # switched to a different editor type entirely). Region-relative
+            # math doesn't make sense here, so just idle without touching
+            # any of it -- still allow closing the panel.
+            if event.type == 'ESC':
+                self.closed = True
+            return {'PASS_THROUGH'}
+
         lx, ly = self.local_mouse(context, event)
 
         if event.type == 'TIMER':
@@ -1746,19 +1784,6 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
                     # buttons while you're just arranging the layout
                     apply_picker_selection(context, [], extend=False)
                     self.rebuild_rows(context)
-                return {'RUNNING_MODAL'}
-            if self.point_in(lx, ly, r["layout_reset"]):
-                for row_data in self.rows:
-                    entry = get_layout_entry(context, row_data["index"])
-                    if entry:
-                        entry.pos_x = -1.0
-                        entry.pos_y = -1.0
-                        entry.box_w = -1.0
-                        entry.box_h = -1.0
-                self.canvas_zoom = 1.0
-                self.scroll_offset = 0.0
-                self.rebuild_rows(context)
-                self.recompute_height(context)
                 return {'RUNNING_MODAL'}
             if self.point_in(lx, ly, r["export"]):
                 bpy.ops.freepicker.export_sets('INVOKE_DEFAULT')

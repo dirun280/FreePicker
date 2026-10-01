@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FreePicker",
     "author": "dirun",
-    "version": (4, 0, 2),
+    "version": (4, 2, 0),
     "blender": (5, 0, 0),
     "location": "View3D header (Object/Pose Mode) > FreePicker button",
     "description": "A fully self-contained picker: its own Pose-mode bone sets "
@@ -30,8 +30,7 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Draw helpers -- same technique used by "Animo Sliders": everything is
-# hand-drawn vector shapes via the gpu module, not real icon images.
+# Draw helpers -- hand-drawn vector shapes via the gpu module, not icon images.
 # ---------------------------------------------------------------------------
 
 def rgb01(rgb, alpha=1.0):
@@ -202,6 +201,12 @@ def clip_text(text, size, max_width):
 # ---------------------------------------------------------------------------
 
 _active_panel = {"instance": None}
+
+# Remembers the panel's geometry across close/reopen (within this Blender
+# session) so it doesn't jump back to the default size/position every time.
+_last_geometry = {
+    "width": None, "manual_height": None, "panel_x": None, "panel_y": None,
+}
 _color_sync_guard = {"active": False}
 
 
@@ -278,7 +283,6 @@ class FREEPICKER_set(bpy.types.PropertyGroup):
         default=(0.5, 0.5, 0.5, 1.0), min=0.0, max=1.0,
         update=_sync_color_to_selection,
     )
-    highlighted: bpy.props.BoolProperty(default=False)
     members: bpy.props.CollectionProperty(type=FREEPICKER_member)
     pos_x: bpy.props.FloatProperty(default=-1.0)
     pos_y: bpy.props.FloatProperty(default=-1.0)
@@ -351,9 +355,12 @@ def get_layout_entry(context, index):
 
 
 def apply_picker_selection(context, indices, extend):
-    """Select (or toggle, if extend) the members of the given selection-set
-    indices. Shared by the single-click operator and the box-select
-    (marquee) tool so both stay in sync."""
+    """Select (or toggle membership, if extend) the members of the given
+    selection-set indices, based on their LIVE selection state in the
+    viewport -- not a separate cached flag, so this always matches whatever
+    was selected/deselected directly in the viewport too. Shared by the
+    single-click operator and the box-select (marquee) tool so both stay
+    in sync."""
     mode = context.mode
 
     if mode == 'POSE':
@@ -363,19 +370,21 @@ def apply_picker_selection(context, indices, extend):
         if not extend:
             for pbone in arm.pose.bones:
                 pbone.select = False
-            for s in arm.freepicker_bone_sets:
-                s.highlighted = False
         last_bone = None
         for idx in indices:
             if not (0 <= idx < len(arm.freepicker_bone_sets)):
                 continue
             sel_set = arm.freepicker_bone_sets[idx]
-            sel_set.highlighted = (not sel_set.highlighted) if extend else True
-            for m in sel_set.members:
-                pbone = arm.pose.bones.get(m.bone_name)
-                if pbone:
-                    pbone.select = True
-                    last_bone = pbone
+            members = [arm.pose.bones.get(m.bone_name) for m in sel_set.members]
+            members = [pb for pb in members if pb is not None]
+            if extend and members and all(pb.select for pb in members):
+                # shift-clicking an already-fully-selected button removes it
+                for pb in members:
+                    pb.select = False
+            else:
+                for pb in members:
+                    pb.select = True
+                    last_bone = pb
         if last_bone:
             arm.data.bones.active = last_bone.bone
 
@@ -384,19 +393,20 @@ def apply_picker_selection(context, indices, extend):
         if not extend:
             for obj in context.view_layer.objects:
                 obj.select_set(False)
-            for s in scene.freepicker_sets:
-                s.highlighted = False
         last_obj = None
         for idx in indices:
             if not (0 <= idx < len(scene.freepicker_sets)):
                 continue
             sel_set = scene.freepicker_sets[idx]
-            sel_set.highlighted = (not sel_set.highlighted) if extend else True
-            for m in sel_set.members:
-                obj = bpy.data.objects.get(m.obj_name)
-                if obj and obj.name in context.view_layer.objects:
-                    obj.select_set(True)
-                    last_obj = obj
+            objs = [bpy.data.objects.get(m.obj_name) for m in sel_set.members]
+            objs = [o for o in objs if o is not None and o.name in context.view_layer.objects]
+            if extend and objs and all(o.select_get() for o in objs):
+                for o in objs:
+                    o.select_set(False)
+            else:
+                for o in objs:
+                    o.select_set(True)
+                    last_obj = o
         if last_obj:
             context.view_layer.objects.active = last_obj
 
@@ -640,7 +650,9 @@ class FREEPICKER_OT_set_shape(bpy.types.Operator):
 
 
 class FREEPICKER_OT_remove(bpy.types.Operator):
-    """Delete this button entirely (the set and all its members)"""
+    """Delete this button entirely (the set and all its members). If this
+    button is part of a multi-selection (box-selected in Edit Mode), all of
+    the selected buttons are deleted together."""
     bl_idname = "freepicker.remove_set"
     bl_label = "Delete Button"
     bl_options = {'UNDO'}
@@ -650,25 +662,33 @@ class FREEPICKER_OT_remove(bpy.types.Operator):
     def execute(self, context):
         mode = context.mode
 
-        if mode == 'POSE':
-            arm = context.object
-            if not arm or arm.type != 'ARMATURE':
-                return {'CANCELLED'}
-            if not (0 <= self.index < len(arm.freepicker_bone_sets)):
-                return {'CANCELLED'}
+        indices = {self.index}
+        panel = _active_panel["instance"]
+        if panel is not None and getattr(panel, "edit_mode", False):
+            selected = getattr(panel, "edit_selected", None)
+            if selected and self.index in selected and len(selected) > 1:
+                indices = set(selected)
 
-            name = arm.freepicker_bone_sets[self.index].name
-            arm.freepicker_bone_sets.remove(self.index)
-            self.report({'INFO'}, f"Set '{name}' deleted")
-            return {'FINISHED'}
+        # remove highest index first so earlier indices in the same
+        # collection don't shift out from under us
+        for idx in sorted(indices, reverse=True):
+            if mode == 'POSE':
+                arm = context.object
+                if not arm or arm.type != 'ARMATURE':
+                    continue
+                if 0 <= idx < len(arm.freepicker_bone_sets):
+                    arm.freepicker_bone_sets.remove(idx)
+            elif mode == 'OBJECT':
+                scene = context.scene
+                if 0 <= idx < len(scene.freepicker_sets):
+                    scene.freepicker_sets.remove(idx)
 
-        elif mode == 'OBJECT':
-            scene = context.scene
-            if 0 <= self.index < len(scene.freepicker_sets):
-                name = scene.freepicker_sets[self.index].name
-                scene.freepicker_sets.remove(self.index)
-                self.report({'INFO'}, f"Set '{name}' deleted")
-            return {'FINISHED'}
+        if panel is not None:
+            panel.edit_selected = set()
+
+        self.report({'INFO'}, f"Deleted {len(indices)} button(s)" if len(indices) > 1
+                    else "Button deleted")
+        return {'FINISHED'}
 
         return {'CANCELLED'}
 
@@ -930,12 +950,16 @@ class FREEPICKER_MT_row_menu(bpy.types.Menu):
                              icon='INFO')
 
         layout.separator()
-        dop = layout.operator("freepicker.remove_set", text="Delete Button", icon='X')
+        panel = _active_panel["instance"]
+        multi = (panel is not None and panel.edit_mode
+                 and idx in panel.edit_selected and len(panel.edit_selected) > 1)
+        delete_label = f"Delete {len(panel.edit_selected)} Buttons" if multi else "Delete Button"
+        dop = layout.operator("freepicker.remove_set", text=delete_label, icon='X')
         dop.index = idx
 
 
 # ---------------------------------------------------------------------------
-# Floating panel -- custom-drawn UI (Animo-style)
+# Floating panel -- custom-drawn UI
 # ---------------------------------------------------------------------------
 
 ACCENT = (90, 170, 255)
@@ -958,20 +982,26 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
 
     def invoke(self, context, event):
         if FREEPICKER_OT_floating_panel._is_open:
-            self.report({'INFO'}, "FreePicker panel is already open")
+            # toggle: clicking the header button again while it's already
+            # open just closes it, from any viewport
+            panel = _active_panel["instance"]
+            if panel is not None:
+                panel.closed = True
+            if context.area:
+                context.area.tag_redraw()
             return {'CANCELLED'}
 
         if context.area is None or context.area.type != 'VIEW_3D':
             self.report({'WARNING'}, "Open this from a 3D Viewport")
             return {'CANCELLED'}
 
-        self.width = dpi(460, context)
+        self.width = _last_geometry["width"] if _last_geometry["width"] is not None else dpi(460, context)
         self.pad = dpi(10, context)
         self.header_h = dpi(142, context)
         self.row_h = dpi(30, context)
         self.min_list_h = self.row_h + dpi(10, context)
         self.max_height = dpi(760, context)
-        self.manual_height = None  # set once the user drags the corner grip vertically
+        self.manual_height = _last_geometry["manual_height"]  # None = auto-fit to content
         self.canvas_zoom = 1.0
         self.zoom_min = 0.3
         self.zoom_max = 3.0
@@ -981,9 +1011,13 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         self._pan_orig = (0.0, 0.0)
         self.footer_h = dpi(20, context)
 
-        margin = dpi(20, context)
-        self.panel_x = margin
-        self.panel_y = margin
+        if _last_geometry["panel_x"] is not None:
+            self.panel_x = _last_geometry["panel_x"]
+            self.panel_y = _last_geometry["panel_y"]
+        else:
+            margin = dpi(20, context)
+            self.panel_x = margin
+            self.panel_y = margin
 
         FREEPICKER_OT_floating_panel._is_open = True
 
@@ -1027,7 +1061,7 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         self.recompute_height(context)
         self.clamp_panel_position(context)
 
-        args = (context,)
+        args = ()
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
             self.draw_callback, args, 'WINDOW', 'POST_PIXEL'
         )
@@ -1035,6 +1069,11 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         context.window_manager.modal_handler_add(self)
         context.area.tag_redraw()
         _active_panel["instance"] = self
+        # Only this exact 3D Viewport region should show/respond to the
+        # panel -- SpaceView3D.draw_handler_add fires for every 3D Viewport
+        # in the window, and without this a split viewport would show (and
+        # try to interact with) a second copy of the same panel.
+        self._home_region_ptr = context.region.as_pointer()
         return {'RUNNING_MODAL'}
 
     # -- geometry / state -----------------------------------------------
@@ -1143,11 +1182,18 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
 
     # -- drawing -----------------------------------------------------------
 
-    def draw_callback(self, context):
+    def draw_callback(self):
+        # Always use the live context for drawing -- never one captured at
+        # invoke() time via draw_handler_add's args, since that reference
+        # can go stale (or point at data Blender has since freed) if the
+        # viewport is later split, merged, or otherwise restructured. A
+        # stale region/area silently returns wrong info instead of raising
+        # an error, which breaks every bit of hit-testing that depends on it.
+        context = bpy.context
         try:
             self._draw_callback(context)
         except Exception as exc:
-            print("Picker: draw error:", exc)
+            print("FreePicker: draw error:", exc)
 
     def _header_rects(self, context):
         x, y, w = self.panel_x, self.panel_y, self.width
@@ -1179,6 +1225,13 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         }
 
     def _draw_callback(self, context):
+        region = context.region
+        if region is None or region.as_pointer() != self._home_region_ptr:
+            # this is a different 3D Viewport than the one the panel was
+            # opened in (e.g. after splitting the viewport) -- don't draw a
+            # second copy of it there.
+            return
+
         if self.mode_cached != context.mode:
             self.rebuild_rows(context)
             self.recompute_height(context)
@@ -1296,32 +1349,29 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
             cx, cy = bx + bw / 2.0, by + bh / 2.0
             r = min(bw, bh) / 2.0
             draw_circle(cx, cy, r, color)
-            if row_data["highlighted"]:
-                draw_circle(cx, cy, r, (1, 1, 1, 0.12))
             if row_data["active"]:
-                draw_circle_outline(cx, cy, r + 1.5, (0.35, 1.0, 0.35, 0.35), width=3.0)
-                draw_circle_outline(cx, cy, r, (0.55, 1.0, 0.45, 1.0), width=1.6)
+                # dark outer ring first for contrast, bright white ring on
+                # top -- keeps the "selected" glow visible even when the
+                # button's own color is white/light.
+                draw_circle_outline(cx, cy, r + 2.0, (0.0, 0.0, 0.0, 0.55), width=3.5)
+                draw_circle_outline(cx, cy, r, (1.0, 1.0, 1.0, 1.0), width=1.8)
 
         elif shape == 'TRIANGLE':
             p1, p2, p3 = tri_points(bx, by, bw, bh)
             draw_triangle(p1, p2, p3, color)
-            if row_data["highlighted"]:
-                draw_triangle(p1, p2, p3, (1, 1, 1, 0.12))
             if row_data["active"]:
-                pad = 1.5
+                pad = 2.0
                 p1o, p2o, p3o = tri_points(bx - pad, by - pad, bw + 2 * pad, bh + 2 * pad)
-                draw_triangle_outline(p1o, p2o, p3o, (0.35, 1.0, 0.35, 0.35), width=3.0)
-                draw_triangle_outline(p1, p2, p3, (0.55, 1.0, 0.45, 1.0), width=1.6)
+                draw_triangle_outline(p1o, p2o, p3o, (0.0, 0.0, 0.0, 0.55), width=3.5)
+                draw_triangle_outline(p1, p2, p3, (1.0, 1.0, 1.0, 1.0), width=1.8)
 
         else:  # SQUARE (default)
             draw_rounded_rect(bx, by, bw, bh, radius, color)
-            if row_data["highlighted"]:
-                draw_rounded_rect(bx, by, bw, bh, radius, (1, 1, 1, 0.12))
             if row_data["active"]:
-                draw_rounded_rect_outline(bx - 1.5, by - 1.5, bw + 3, bh + 3, dpi(6, context),
-                                           (0.35, 1.0, 0.35, 0.35), width=3.0)
+                draw_rounded_rect_outline(bx - 2.0, by - 2.0, bw + 4, bh + 4, dpi(7, context),
+                                           (0.0, 0.0, 0.0, 0.55), width=3.5)
                 draw_rounded_rect_outline(bx, by, bw, bh, radius,
-                                           (0.55, 1.0, 0.45, 1.0), width=1.6)
+                                           (1.0, 1.0, 1.0, 1.0), width=1.8)
 
         # optional name label -- hidden by default, turned on per-button via
         # the right-click menu ("Add Name")
@@ -1464,6 +1514,12 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         FREEPICKER_OT_floating_panel._is_open = False
         if _active_panel["instance"] is self:
             _active_panel["instance"] = None
+        # remember the geometry as of this close, so the next time the
+        # panel is opened it picks up right where you left it
+        _last_geometry["width"] = self.width
+        _last_geometry["manual_height"] = self.manual_height
+        _last_geometry["panel_x"] = self.panel_x
+        _last_geometry["panel_y"] = self.panel_y
         try:
             bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
         except Exception:
@@ -1507,7 +1563,8 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         area = context.area
         region = context.region
         in_view3d = (area is not None and area.type == 'VIEW_3D'
-                     and region is not None and region.type == 'WINDOW')
+                     and region is not None and region.type == 'WINDOW'
+                     and region.as_pointer() == self._home_region_ptr)
 
         if area is not None:
             area.tag_redraw()
@@ -1515,10 +1572,24 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         if not in_view3d:
             # The mouse has moved outside the 3D Viewport (or this area was
             # switched to a different editor type entirely). Region-relative
-            # math doesn't make sense here, so just idle without touching
-            # any of it -- still allow closing the panel.
+            # math doesn't make sense here, so just idle -- but still clear
+            # any drag/resize/marquee state on release, otherwise a release
+            # that lands outside a valid region would leave it stuck forever
+            # (the panel would look frozen once you come back to the 3D
+            # Viewport, since it would think a drag is still in progress).
             if event.type == 'ESC':
                 self.closed = True
+            elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+                self.marquee_start = None
+                self.marquee_end = None
+                self.marquee_dragging = False
+                self.marquee_press_row = None
+                self.dragging_row_index = None
+                self.resizing_row_index = None
+                self._drag_group_orig = {}
+                self.dragging_panel = False
+                self.resizing = False
+                self.edit_dragging_select = False
             return {'PASS_THROUGH'}
 
         lx, ly = self.local_mouse(context, event)

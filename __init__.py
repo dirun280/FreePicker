@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FreePicker",
     "author": "dirun",
-    "version": (4, 2, 0),
+    "version": (4, 3, 0),
     "blender": (5, 0, 0),
     "location": "View3D header (Object/Pose Mode) > FreePicker button",
     "description": "A fully self-contained picker: its own Pose-mode bone sets "
@@ -214,10 +214,7 @@ def _sync_color_to_selection(entry, context):
     if _color_sync_guard["active"]:
         return
     panel = _active_panel["instance"]
-    if panel is None or not getattr(panel, "edit_mode", False):
-        return
-    selected = getattr(panel, "edit_selected", None)
-    if not selected or len(selected) <= 1:
+    if panel is None:
         return
 
     mode = context.mode
@@ -236,7 +233,20 @@ def _sync_color_to_selection(entry, context):
                 idx = i
                 break
 
-    if idx is None or idx not in selected:
+    if idx is None:
+        return
+
+    if getattr(panel, "edit_mode", False):
+        # Edit Mode: broadcast to whatever's box-selected for layout editing
+        selected = getattr(panel, "edit_selected", None) or set()
+    else:
+        # Locked mode: there's no separate "selection" concept to box-select
+        # here, so broadcast to whichever buttons are currently shown as
+        # active (their members are fully selected in the viewport) --
+        # i.e. whatever you just multi-selected via marquee/shift-click.
+        selected = {row["index"] for row in getattr(panel, "rows", []) if row.get("active")}
+
+    if idx not in selected or len(selected) <= 1:
         return
 
     _color_sync_guard["active"] = True
@@ -305,7 +315,6 @@ class FREEPICKER_pose_set(bpy.types.PropertyGroup):
         default=(0.5, 0.5, 0.5, 1.0), min=0.0, max=1.0,
         update=_sync_color_to_selection,
     )
-    highlighted: bpy.props.BoolProperty(default=False)
     members: bpy.props.CollectionProperty(type=FREEPICKER_bone_member)
     pos_x: bpy.props.FloatProperty(default=-1.0)
     pos_y: bpy.props.FloatProperty(default=-1.0)
@@ -944,10 +953,14 @@ class FREEPICKER_MT_row_menu(bpy.types.Menu):
             color_row.label(text="", icon='COLOR')
             color_row.prop(entry, "color", text="")
             panel = _active_panel["instance"]
-            if panel is not None and panel.edit_mode and idx in panel.edit_selected \
-                    and len(panel.edit_selected) > 1:
-                layout.label(text=f"Applies to {len(panel.edit_selected)} selected buttons",
-                             icon='INFO')
+            if panel is not None:
+                if panel.edit_mode:
+                    group = panel.edit_selected
+                else:
+                    group = {row["index"] for row in panel.rows if row.get("active")}
+                if idx in group and len(group) > 1:
+                    layout.label(text=f"Applies to {len(group)} selected buttons",
+                                 icon='INFO')
 
         layout.separator()
         panel = _active_panel["instance"]
@@ -981,6 +994,31 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         return context.mode in {'OBJECT', 'POSE'}
 
     def invoke(self, context, event):
+        try:
+            return self._invoke_impl(context, event)
+        except Exception as exc:
+            # if setup fails partway through, don't leave "_is_open" stuck
+            # True forever -- that would permanently disable the header
+            # button (toggling would try to close a panel that was never
+            # actually finished opening).
+            print("FreePicker: failed to open, resetting state:", exc)
+            FREEPICKER_OT_floating_panel._is_open = False
+            if _active_panel["instance"] is self:
+                _active_panel["instance"] = None
+            try:
+                if hasattr(self, "_handle"):
+                    bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_timer"):
+                    context.window_manager.event_timer_remove(self._timer)
+            except Exception:
+                pass
+            self.report({'ERROR'}, f"FreePicker failed to open: {exc}")
+            return {'CANCELLED'}
+
+    def _invoke_impl(self, context, event):
         if FREEPICKER_OT_floating_panel._is_open:
             # toggle: clicking the header button again while it's already
             # open just closes it, from any viewport
@@ -1100,7 +1138,6 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
                         "index": i,
                         "name": sel_set.name,
                         "color": sel_set.color[:],
-                        "highlighted": sel_set.highlighted,
                         "active": pose_set_is_active(context, sel_set),
                         "count": len(sel_set.members),
                         "pos_x": sel_set.pos_x,
@@ -1117,7 +1154,6 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
                     "index": i,
                     "name": sel_set.name,
                     "color": sel_set.color[:],
-                    "highlighted": sel_set.highlighted,
                     "active": object_set_is_active(context, sel_set),
                     "count": len(sel_set.members),
                     "pos_x": sel_set.pos_x,
@@ -1826,9 +1862,12 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
                 self.closed = True
                 return {'RUNNING_MODAL'}
 
-            # the panel can only be dragged from the title bar row, in any mode
+            # the panel can be dragged from the whole header strip -- from
+            # the title row up to the panel's very top edge (including the
+            # small gap/corner area above the text), in any mode
             title_x, title_y, title_w, title_h = r["title"]
-            if (title_y <= ly <= title_y + title_h and
+            panel_top = self.panel_y + self.height
+            if (title_y <= ly <= panel_top and
                     self.panel_x <= lx <= self.panel_x + self.width):
                 self.dragging_panel = True
                 self.drag_origin = (lx, ly)

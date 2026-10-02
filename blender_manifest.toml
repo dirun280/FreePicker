@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "freepicker"
-version = "4.1.0"
+version = "4.3.0"
 name = "FreePicker"
 tagline = "Floating, drag-and-resize bone/object picker panel"
 maintainer = "dirun <kodirunart@gmail.com>"

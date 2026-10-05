@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FreePicker",
     "author": "dirun",
-    "version": (4, 3, 0),
+    "version": (4, 7, 0),
     "blender": (5, 0, 0),
     "location": "View3D header (Object/Pose Mode) > FreePicker button",
     "description": "A fully self-contained picker: its own Pose-mode bone sets "
@@ -210,6 +210,23 @@ _last_geometry = {
 _color_sync_guard = {"active": False}
 
 
+def _get_broadcast_group(panel, idx):
+    """Return the set of row indices an action on `idx` (color, shape,
+    delete, ...) should apply to, based on whatever's currently
+    multi-selected: box-selected buttons in Edit Mode, or buttons currently
+    shown active (fully selected in the viewport) in Locked mode. Falls
+    back to just {idx} alone when there's no multi-selection."""
+    if panel is None:
+        return {idx}
+    if getattr(panel, "edit_mode", False):
+        group = set(getattr(panel, "edit_selected", None) or set())
+    else:
+        group = {row["index"] for row in getattr(panel, "rows", []) if row.get("active")}
+    if idx in group and len(group) > 1:
+        return group
+    return {idx}
+
+
 def _sync_color_to_selection(entry, context):
     if _color_sync_guard["active"]:
         return
@@ -236,17 +253,8 @@ def _sync_color_to_selection(entry, context):
     if idx is None:
         return
 
-    if getattr(panel, "edit_mode", False):
-        # Edit Mode: broadcast to whatever's box-selected for layout editing
-        selected = getattr(panel, "edit_selected", None) or set()
-    else:
-        # Locked mode: there's no separate "selection" concept to box-select
-        # here, so broadcast to whichever buttons are currently shown as
-        # active (their members are fully selected in the viewport) --
-        # i.e. whatever you just multi-selected via marquee/shift-click.
-        selected = {row["index"] for row in getattr(panel, "rows", []) if row.get("active")}
-
-    if idx not in selected or len(selected) <= 1:
+    selected = _get_broadcast_group(panel, idx)
+    if len(selected) <= 1:
         return
 
     _color_sync_guard["active"] = True
@@ -642,7 +650,10 @@ class FREEPICKER_OT_remove_members(bpy.types.Operator):
 
 
 class FREEPICKER_OT_set_shape(bpy.types.Operator):
-    """Change this button's shape (square / circle / triangle)"""
+    """Change this button's shape (square / circle / triangle). If this
+    button is part of a multi-selection (box-selected in Edit Mode, or
+    multiple buttons currently active in Locked mode), all of them change
+    together."""
     bl_idname = "freepicker.set_shape"
     bl_label = "Set Button Shape"
     bl_options = {'UNDO'}
@@ -654,14 +665,94 @@ class FREEPICKER_OT_set_shape(bpy.types.Operator):
         entry = get_layout_entry(context, self.index)
         if entry is None:
             return {'CANCELLED'}
-        entry.shape = self.shape
+
+        panel = _active_panel["instance"]
+        group = _get_broadcast_group(panel, self.index)
+        for idx in group:
+            other = entry if idx == self.index else get_layout_entry(context, idx)
+            if other is not None:
+                other.shape = self.shape
         return {'FINISHED'}
+
+
+class FREEPICKER_OT_duplicate(bpy.types.Operator):
+    """Duplicate this button (color, shape, name and members), placed right
+    next to the original."""
+    bl_idname = "freepicker.duplicate_set"
+    bl_label = "Duplicate Button"
+    bl_options = {'UNDO'}
+
+    index: bpy.props.IntProperty()
+
+    def _place_next_to(self, new_set, src):
+        gap = 8.0
+        panel = _active_panel["instance"]
+        row = None
+        if panel is not None:
+            row = next((r for r in panel.rows if r["index"] == self.index), None)
+        if panel is not None and row is not None:
+            list_w = panel.width - 2 * panel.pad
+            box_w, box_h = panel.effective_box(list_w, row)
+            pos_x, pos_y = panel.effective_pos(row)
+        else:
+            # panel/row info not available -- fall back to the source's own
+            # stored values (or sane defaults if it was never customized)
+            box_w = src.box_w if src.box_w > 0 else NEW_BUTTON_SIZE
+            box_h = src.box_h if src.box_h > 0 else NEW_BUTTON_SIZE
+            pos_x = src.pos_x if src.pos_x >= 0 else 0.0
+            pos_y = src.pos_y if src.pos_y >= 0 else 0.0
+        new_set.box_w = box_w
+        new_set.box_h = box_h
+        new_set.pos_x = pos_x + box_w + gap
+        new_set.pos_y = pos_y
+
+    def execute(self, context):
+        mode = context.mode
+
+        if mode == 'POSE':
+            arm = context.object
+            if not arm or arm.type != 'ARMATURE':
+                return {'CANCELLED'}
+            if not (0 <= self.index < len(arm.freepicker_bone_sets)):
+                return {'CANCELLED'}
+            src = arm.freepicker_bone_sets[self.index]
+            new_set = arm.freepicker_bone_sets.add()
+            new_set.name = src.name
+            new_set.color = src.color[:]
+            new_set.shape = src.shape
+            new_set.show_name = src.show_name
+            for m in src.members:
+                nm = new_set.members.add()
+                nm.bone_name = m.bone_name
+            self._place_next_to(new_set, src)
+            self.report({'INFO'}, f"Duplicated '{src.name}'")
+            return {'FINISHED'}
+
+        elif mode == 'OBJECT':
+            scene = context.scene
+            if not (0 <= self.index < len(scene.freepicker_sets)):
+                return {'CANCELLED'}
+            src = scene.freepicker_sets[self.index]
+            new_set = scene.freepicker_sets.add()
+            new_set.name = src.name
+            new_set.color = src.color[:]
+            new_set.shape = src.shape
+            new_set.show_name = src.show_name
+            for m in src.members:
+                nm = new_set.members.add()
+                nm.obj_name = m.obj_name
+            self._place_next_to(new_set, src)
+            self.report({'INFO'}, f"Duplicated '{src.name}'")
+            return {'FINISHED'}
+
+        return {'CANCELLED'}
 
 
 class FREEPICKER_OT_remove(bpy.types.Operator):
     """Delete this button entirely (the set and all its members). If this
-    button is part of a multi-selection (box-selected in Edit Mode), all of
-    the selected buttons are deleted together."""
+    button is part of a multi-selection (box-selected in Edit Mode, or
+    multiple buttons currently active in Locked mode), all of the selected
+    buttons are deleted together."""
     bl_idname = "freepicker.remove_set"
     bl_label = "Delete Button"
     bl_options = {'UNDO'}
@@ -671,12 +762,8 @@ class FREEPICKER_OT_remove(bpy.types.Operator):
     def execute(self, context):
         mode = context.mode
 
-        indices = {self.index}
         panel = _active_panel["instance"]
-        if panel is not None and getattr(panel, "edit_mode", False):
-            selected = getattr(panel, "edit_selected", None)
-            if selected and self.index in selected and len(selected) > 1:
-                indices = set(selected)
+        indices = _get_broadcast_group(panel, self.index)
 
         # remove highest index first so earlier indices in the same
         # collection don't shift out from under us
@@ -918,6 +1005,13 @@ class FREEPICKER_MT_row_menu(bpy.types.Menu):
         add_label = "Add Bone" if is_pose else "Add Object"
         del_label = "Remove Bone" if is_pose else "Delete Object"
 
+        panel = _active_panel["instance"]
+        group = _get_broadcast_group(panel, idx)
+        if len(group) > 1:
+            layout.label(text=f"Color / Shape / Delete apply to {len(group)} buttons",
+                         icon='INFO')
+            layout.separator()
+
         op = layout.operator("freepicker.update_set", text=add_label, icon='ADD')
         op.index = idx
         op2 = layout.operator("freepicker.remove_members", text=del_label, icon='TRASH')
@@ -952,21 +1046,13 @@ class FREEPICKER_MT_row_menu(bpy.types.Menu):
             color_row = layout.row(align=True)
             color_row.label(text="", icon='COLOR')
             color_row.prop(entry, "color", text="")
-            panel = _active_panel["instance"]
-            if panel is not None:
-                if panel.edit_mode:
-                    group = panel.edit_selected
-                else:
-                    group = {row["index"] for row in panel.rows if row.get("active")}
-                if idx in group and len(group) > 1:
-                    layout.label(text=f"Applies to {len(group)} selected buttons",
-                                 icon='INFO')
 
         layout.separator()
-        panel = _active_panel["instance"]
-        multi = (panel is not None and panel.edit_mode
-                 and idx in panel.edit_selected and len(panel.edit_selected) > 1)
-        delete_label = f"Delete {len(panel.edit_selected)} Buttons" if multi else "Delete Button"
+        dupop = layout.operator("freepicker.duplicate_set", text="Duplicate Button", icon='DUPLICATE')
+        dupop.index = idx
+
+        layout.separator()
+        delete_label = f"Delete {len(group)} Buttons" if len(group) > 1 else "Delete Button"
         dop = layout.operator("freepicker.remove_set", text=delete_label, icon='X')
         dop.index = idx
 
@@ -1089,6 +1175,12 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         self.marquee_press_row = None
         self.marquee_shift = False
         self.drag_threshold = dpi(4, context)
+
+        # last known mouse position (region-relative), kept up to date from
+        # modal() so the draw callback -- which has no direct access to the
+        # cursor -- can still draw hover highlights/tooltips under it
+        self._mouse_x = -100000.0
+        self._mouse_y = -100000.0
 
         # Multi-select in Edit Mode: box-select several buttons, then drag
         # any of them to move the whole group together.
@@ -1276,6 +1368,18 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         draw_rounded_rect(x, y, w, h, dpi(14, context), (0.16, 0.16, 0.17, 0.92))
         draw_rounded_rect_outline(x, y, w, h, dpi(14, context), (0.05, 0.05, 0.05, 0.6), width=1.0)
 
+        mouse_x, mouse_y = self._mouse_x, self._mouse_y
+
+        def is_hovered(rect):
+            return self.point_in(mouse_x, mouse_y, rect)
+
+        def hover_ring(rect, radius):
+            rx, ry, rw, rh = rect
+            draw_rounded_rect_outline(rx - 1.5, ry - 1.5, rw + 3, rh + 3, radius,
+                                       (1, 1, 1, 0.9), width=1.5)
+
+        hover_tip = None
+
         r = self._header_rects(context)
         mode_label = "Pose Mode (Bones)" if context.mode == 'POSE' else "Object Mode"
         draw_text(r["title"][0], r["title"][1] + dpi(4, context), mode_label,
@@ -1288,15 +1392,23 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
             zw = blf.dimensions(0, zoom_text)[0]
             draw_text(tx + tw - zw, ty + dpi(4, context), zoom_text, font_size,
                       (0.6, 0.75, 1.0, 1.0))
+        if is_hovered(r["title"]):
+            hover_tip = "Drag here to move the panel"
 
         cx0, cy0, cw, ch = r["close"]
         draw_rounded_rect(cx0, cy0, cw, ch, dpi(6, context), rgb01(DANGER, 0.85))
         draw_text(cx0, cy0 + ch * 0.16, "x", max(14, dpi(20, context)), (1, 1, 1, 1), align_center_width=cw)
+        if is_hovered(r["close"]):
+            hover_ring(r["close"], dpi(6, context))
+            hover_tip = "Close this panel"
 
         ax, ay, aw, ah = r["add"]
         draw_rounded_rect(ax, ay, aw, ah, dpi(8, context), rgb01(ACCENT, 0.9))
         draw_text(ax, ay + ah * 0.28, "+  Add From Selection", max(9, dpi(12, context)),
                   (1, 1, 1, 1), align_center_width=aw)
+        if is_hovered(r["add"]):
+            hover_ring(r["add"], dpi(8, context))
+            hover_tip = "Create a new button from the currently selected bones/objects"
 
         tx, ty, tw, th = r["layout_toggle"]
         toggle_color = rgb01(EDIT_YELLOW, 0.95) if self.edit_mode else rgb01((90, 130, 200), 0.9)
@@ -1305,12 +1417,23 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         draw_rounded_rect(tx, ty, tw, th, dpi(6, context), toggle_color)
         draw_text(tx, ty + th * 0.22, toggle_label, max(8, dpi(10, context)),
                   toggle_text_color, align_center_width=tw)
+        if is_hovered(r["layout_toggle"]):
+            hover_ring(r["layout_toggle"], dpi(6, context))
+            hover_tip = ("Switch to Locked mode -- click/box-select buttons to select bones"
+                         if self.edit_mode else
+                         "Switch to Edit Mode -- drag, resize and rename buttons")
 
-        for key, label in (("export", "Export"), ("import", "Import")):
+        for key, label, tip in (
+            ("export", "Export", "Save all buttons (position, size, shape, color) to a .json file"),
+            ("import", "Import", "Load buttons from a .json file exported by FreePicker"),
+        ):
             bx, by, bw, bh = r[key]
             draw_rounded_rect(bx, by, bw, bh, dpi(6, context), rgb01((70, 70, 72), 0.9))
             draw_text(bx, by + bh * 0.22, label, max(8, dpi(10, context)),
                       (0.9, 0.9, 0.9, 1.0), align_center_width=bw)
+            if is_hovered(r[key]):
+                hover_ring(r[key], dpi(6, context))
+                hover_tip = tip
 
         # -- list area, scissor-clipped and scrollable --
         list_x = x + self.pad
@@ -1331,6 +1454,12 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
                     if ry + rh < list_y - self.row_h or ry > list_y + list_h + self.row_h:
                         continue
                     self.draw_row(context, rx, ry, rw, rh, row_data)
+                    if is_hovered((rx, ry, rw, rh)):
+                        hover_ring((rx, ry, rw, rh), dpi(5, context))
+                        shown_name = row_data["name"] if row_data.get("show_name") else "(unnamed)"
+                        count_label = "bone" if context.mode == 'POSE' else "object"
+                        n = row_data["count"]
+                        hover_tip = f"{shown_name} -- {n} {count_label}{'s' if n != 1 else ''}"
                     if self.edit_mode:
                         is_sel = row_data["index"] in self.edit_selected
                         if is_sel:
@@ -1353,19 +1482,31 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
         finally:
             gpu.state.scissor_test_set(False)
 
-        # bottom-left hint strip: small always-visible instructions
-        hint = "Scroll: list \u00b7 Ctrl+Scroll: zoom \u00b7 MMB drag: pan"
-        draw_text(x + self.pad, y + dpi(4, context), hint, max(9, dpi(11, context)),
-                  (0.55, 0.55, 0.55, 0.85))
-
         # resize grip, bottom-right corner
-        grip_dot = max(1.5, dpi(1.5, context))
+        grip_zone = (x + w - dpi(16, context), y, dpi(16, context), dpi(16, context))
+        grip_hovered = is_hovered(grip_zone)
+        grip_dot = max(1.5, dpi(1.5, context)) * (1.6 if grip_hovered else 1.0)
+        grip_color = (1, 1, 1, 0.9) if grip_hovered else (0.75, 0.75, 0.75, 0.5)
         gx = x + w - dpi(6, context)
         gy = y + dpi(14, context)
         for row in range(3):
             for col in range(row + 1):
                 draw_circle(gx - col * dpi(4, context), gy - row * dpi(4, context),
-                            grip_dot, (0.75, 0.75, 0.75, 0.5))
+                            grip_dot, grip_color)
+        if grip_hovered:
+            hover_tip = "Drag to resize the panel"
+
+        # bottom-left strip: whatever's under the cursor right now, or the
+        # default scroll/zoom/pan instructions when nothing's hovered
+        if hover_tip is not None:
+            hint = hover_tip
+            hint_color = (0.85, 0.85, 0.75, 1.0)
+        else:
+            hint = "Scroll: list \u00b7 Ctrl+Scroll: zoom \u00b7 MMB drag: pan"
+            hint_color = (0.55, 0.55, 0.55, 0.85)
+        font_size = max(9, dpi(11, context))
+        hint = clip_text(hint, font_size, w - 2 * self.pad)
+        draw_text(x + self.pad, y + dpi(4, context), hint, font_size, hint_color)
 
     def draw_row(self, context, x, y, w, h, row_data):
         pad_in = dpi(3, context)
@@ -1613,9 +1754,7 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
             # that lands outside a valid region would leave it stuck forever
             # (the panel would look frozen once you come back to the 3D
             # Viewport, since it would think a drag is still in progress).
-            if event.type == 'ESC':
-                self.closed = True
-            elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
                 self.marquee_start = None
                 self.marquee_end = None
                 self.marquee_dragging = False
@@ -1629,6 +1768,7 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
             return {'PASS_THROUGH'}
 
         lx, ly = self.local_mouse(context, event)
+        self._mouse_x, self._mouse_y = lx, ly
 
         if event.type == 'TIMER':
             self.rebuild_rows(context)
@@ -2012,10 +2152,6 @@ class FREEPICKER_OT_floating_panel(bpy.types.Operator):
                 return {'RUNNING_MODAL'}
             return {'PASS_THROUGH'}
 
-        if event.type == 'ESC':
-            self.closed = True
-            return {'RUNNING_MODAL'}
-
         return {'PASS_THROUGH'}
 
 
@@ -2043,6 +2179,7 @@ classes = (
     FREEPICKER_OT_remove_members,
     FREEPICKER_OT_set_shape,
     FREEPICKER_OT_start_rename,
+    FREEPICKER_OT_duplicate,
     FREEPICKER_OT_remove,
     FREEPICKER_OT_export,
     FREEPICKER_OT_import,
